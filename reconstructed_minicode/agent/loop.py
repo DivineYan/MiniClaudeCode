@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 from typing import Any, Callable
 
 from reconstructed_minicode.agent.context import ContextManager
@@ -41,6 +42,11 @@ RESUME_AFTER_MAX_TOKENS = (
     "Your previous response hit max_tokens during thinking before producing the next "
     "actionable step. Resume immediately and continue with the next concrete tool call, "
     "code change, or an explicit <final> answer only if the task is complete."
+)
+NUDGE_REPEATED_FAILURE = (
+    "You have tried the exact same tool call {tool_name} {count} times and it keeps "
+    "failing with the same error. Stop retrying. Read the file at the relevant lines "
+    "to see the actual content, then construct a corrected call based on what you see."
 )
 
 
@@ -333,6 +339,9 @@ def run_agent_turn(
     thinking_retry = 0
     tool_error_count = 0
     step = 0
+    # Loop detection: track consecutive identical failed tool calls
+    _last_failed_call_key: str | None = None
+    _consecutive_fail_count: int = 0
 
     if context_manager:
         current_messages = _maybe_compact(context_manager, current_messages, on_assistant_message)
@@ -448,6 +457,23 @@ def run_agent_turn(
                 saw_tool_result = True
                 if not result.ok:
                     tool_error_count += 1
+                    call_key = f"{call['toolName']}:{json.dumps(call['input'], sort_keys=True)}"
+                    if call_key == _last_failed_call_key:
+                        _consecutive_fail_count += 1
+                    else:
+                        _last_failed_call_key = call_key
+                        _consecutive_fail_count = 1
+                    if _consecutive_fail_count >= 3:
+                        fail_count = _consecutive_fail_count
+                        _consecutive_fail_count = 0
+                        _last_failed_call_key = None
+                        nudge = NUDGE_REPEATED_FAILURE.format(
+                            tool_name=call["toolName"], count=fail_count
+                        )
+                        current_messages.append({"role": "user", "content": nudge})
+                else:
+                    _last_failed_call_key = None
+                    _consecutive_fail_count = 0
                 if result.awaitUser:
                     if on_assistant_message:
                         on_assistant_message(result.output)
