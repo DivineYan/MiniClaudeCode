@@ -4,13 +4,20 @@ import concurrent.futures
 import json
 from typing import Any, Callable
 
-from reconstructed_minicode.agent.context import ContextManager
+from reconstructed_minicode.agent.context import ContextManager, estimate_message_tokens
 from reconstructed_minicode.agent.state import Store, AppState, increment_tool_calls, set_busy, set_idle
 from reconstructed_minicode.extensions.hooks import HookEvent, fire_hook_sync, fire_post_tool_hook, fire_pre_tool_hook, fire_stop_hook
 from reconstructed_minicode.security.permissions import PermissionManager
 from reconstructed_minicode.tools.base import ToolContext, ToolRegistry, ToolResult
 from reconstructed_minicode.types import AgentStep, ChatMessage, ModelAdapter
 from reconstructed_minicode.utils.logging import get_logger
+
+from reconstructed_minicode.reliability.agent_metrics import AgentMetricsCollector
+from reconstructed_minicode.reliability.agent_intelligence import ErrorClassifier, NudgeGenerator, ToolScheduler
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from reconstructed_minicode.extensions.memory_injector import MemoryInjector
 
 logger = get_logger("agent_loop")
 
@@ -224,22 +231,35 @@ def _run_tool_calls(
     step: int,
     on_tool_start: Callable[[str, dict], None] | None,
     on_tool_result: Callable[[str, str, bool], None] | None,
+    tool_scheduler: ToolScheduler | None = None,
+    metrics_collector: AgentMetricsCollector | None = None,
 ) -> list[tuple[dict, ToolResult]]:
     """Partition calls into concurrent-safe and serial, execute both, return ordered results."""
     if len(calls) == 1:
+        if metrics_collector:
+            metrics_collector.start_tool(calls[0]["toolName"])
         result = _execute_single_tool(
             calls[0], tools, cwd, permissions, runtime, store, step,
             on_tool_start, on_tool_result,
         )
+        if metrics_collector:
+            metrics_collector.end_tool(success=result.ok, error=result.output if not result.ok else "")
         return [(calls[0], result)]
 
-    concurrent_calls = [c for c in calls if (t := tools.find(c["toolName"])) and t.is_concurrency_safe]
-    serial_calls = [c for c in calls if not ((t := tools.find(c["toolName"])) and t.is_concurrency_safe)]
+    # Use ToolScheduler for intelligent partitioning if available, else simple flag check
+    if tool_scheduler:
+        concurrent_calls, serial_calls = tool_scheduler.schedule_calls(calls, tools)
+        max_workers = tool_scheduler.get_recommended_max_workers(concurrent_calls)
+    else:
+        concurrent_calls = [c for c in calls if (t := tools.find(c["toolName"])) and t.is_concurrency_safe]
+        serial_calls = [c for c in calls if not ((t := tools.find(c["toolName"])) and t.is_concurrency_safe)]
+        max_workers = min(len(concurrent_calls), 8)
+
     results: list[tuple[dict, ToolResult]] = []
 
     if concurrent_calls:
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(len(concurrent_calls), 8),
+            max_workers=max_workers,
             thread_name_prefix="mc-tool",
         ) as pool:
             future_map = {
@@ -259,13 +279,24 @@ def _run_tool_calls(
                 results.append((call, result))
 
     for call in serial_calls:
+        if metrics_collector:
+            metrics_collector.start_tool(call["toolName"])
         result = _execute_single_tool(
             call, tools, cwd, permissions, runtime, store, step,
             on_tool_start, on_tool_result,
         )
+        if metrics_collector:
+            metrics_collector.end_tool(success=result.ok, error=result.output if not result.ok else "")
         results.append((call, result))
         if result.awaitUser:
             break
+
+    # Record conflicts between concurrent tools that both failed
+    if tool_scheduler:
+        failed_concurrent = [call for call, res in results if not res.ok and call in concurrent_calls]
+        for i, call_a in enumerate(failed_concurrent):
+            for call_b in failed_concurrent[i + 1:]:
+                tool_scheduler.record_conflict(call_a["toolName"], call_b["toolName"])
 
     # Restore original call order
     order = {call["id"]: i for i, call in enumerate(calls)}
@@ -338,6 +369,8 @@ def run_agent_turn(
     on_assistant_stream_chunk: Callable[[str], None] | None = None,
     context_manager: ContextManager | None = None,
     runtime: dict | None = None,
+    metrics_collector: AgentMetricsCollector | None = None,
+    memory_injector: MemoryInjector | None = None,
 ) -> list[ChatMessage]:
     current_messages = list(messages)
     saw_tool_result = False
@@ -348,6 +381,8 @@ def run_agent_turn(
     # Loop detection: track total frequency of each call key within this turn
     _call_freq: dict[str, int] = {}
     _nudged_keys: set[str] = set()
+
+    tool_scheduler = ToolScheduler(metrics_collector=metrics_collector)
 
     if context_manager:
         current_messages = _maybe_compact(context_manager, current_messages, on_assistant_message)
@@ -448,14 +483,36 @@ def run_agent_turn(
                 return current_messages
 
             calls = next_step.calls
+            if metrics_collector:
+                metrics_collector.start_turn(step)
             results = _run_tool_calls(
                 calls, tools, cwd, permissions, runtime, store, step,
                 on_tool_start, on_tool_result,
+                tool_scheduler=tool_scheduler,
+                metrics_collector=metrics_collector,
             )
+            if metrics_collector:
+                total_tokens = sum(
+                    estimate_message_tokens(m) for m in current_messages
+                ) if context_manager else 0
+                metrics_collector.end_turn(total_tokens=total_tokens)
 
             for call, result in results:
                 tool_def = tools.find(call["toolName"])
                 is_concurrent = bool(tool_def and tool_def.is_concurrency_safe and len(calls) > 1)
+                if not result.ok:
+                    classified = ErrorClassifier.classify(result.output, tool_name=call["toolName"])
+                    nudge_msg = NudgeGenerator.generate(classified, retry_count=tool_error_count)
+                    extra = "\n\n[System note: " + nudge_msg + "]"
+                    if memory_injector is not None:
+                        failure_mems = memory_injector.inject_on_failure(result.output, call["toolName"])
+                        if failure_mems:
+                            extra += "\n\n" + memory_injector.format_for_prompt(failure_mems)
+                    result = ToolResult(
+                        ok=False,
+                        output=result.output + extra,
+                        awaitUser=result.awaitUser,
+                    )
                 _append_tool_messages(
                     call, result, current_messages, is_concurrent, step,
                     store, on_tool_start, on_tool_result,

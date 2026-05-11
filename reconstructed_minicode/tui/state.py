@@ -11,6 +11,11 @@ from reconstructed_minicode.tools.base import ToolRegistry
 from reconstructed_minicode.tui.types import TranscriptEntry
 from reconstructed_minicode.types import ChatMessage, ModelAdapter
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from reconstructed_minicode.extensions.memory import MemoryManager
+    from reconstructed_minicode.extensions.memory_injector import MemoryInjector
+
 
 @dataclass
 class TtyAppArgs:
@@ -20,6 +25,8 @@ class TtyAppArgs:
     messages: list[ChatMessage]
     cwd: str
     permissions: PermissionManager
+    memory_mgr: MemoryManager | None = None
+    memory_injector: MemoryInjector | None = None
 
 
 @dataclass

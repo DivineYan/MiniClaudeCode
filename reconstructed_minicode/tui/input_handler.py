@@ -304,6 +304,13 @@ def _handle_input(
         _push_transcript_entry(state, kind="assistant", body=local_result)
         return False
 
+    # Memory commands: #tag or /memory add
+    if args.memory_mgr is not None:
+        mem_result = args.memory_mgr.handle_user_memory_input(input_text)
+        if mem_result is not None:
+            _push_transcript_entry(state, kind="assistant", body=mem_result)
+            return False
+
     # Tool shortcuts
     shortcut = parse_local_tool_shortcut(input_text)
     if shortcut:
@@ -359,17 +366,22 @@ def _handle_input(
     aggregated_edit_by_entry_id: dict[int, AggregatedEditProgress] = {}
 
     # Refresh system prompt
-    args.messages[0] = {
-        "role": "system",
-        "content": build_system_prompt(
-            args.cwd,
-            args.permissions.get_summary(),
-            {
-                "skills": args.tools.get_skills(),
-                "mcpServers": args.tools.get_mcp_servers(),
-            },
-        ),
-    }
+    system_prompt = build_system_prompt(
+        args.cwd,
+        args.permissions.get_summary(),
+        {
+            "skills": args.tools.get_skills(),
+            "mcpServers": args.tools.get_mcp_servers(),
+        },
+    )
+
+    # Inject task-relevant memories into system prompt
+    if args.memory_injector is not None:
+        injected = args.memory_injector.inject_for_task(input_text)
+        if injected:
+            system_prompt += "\n\n" + args.memory_injector.format_for_prompt(injected)
+
+    args.messages[0] = {"role": "system", "content": system_prompt}
     args.messages.append({"role": "user", "content": input_text})
 
     active_stream_entry_id = None
@@ -572,6 +584,7 @@ def _handle_input(
                 on_progress_message=on_progress_message,
                 on_assistant_stream_chunk=on_assistant_stream_chunk,
                 runtime=args.runtime,
+                memory_injector=args.memory_injector,
             )
             with agent_thread_lock:
                 agent_result["messages"] = next_messages
