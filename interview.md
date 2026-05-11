@@ -1,8 +1,5 @@
 # MiniCode Python — 面试拷打手册
 
-> 从面试官视角出发，覆盖项目架构、简历亮点、常见追问。
-> 每道题给出**答题思路**，辅以关键代码片段，不堆代码。
-
 ---
 
 ## 一、项目整体理解
@@ -132,7 +129,7 @@ if _is_recoverable_thinking_stop(...) and recoverable_thinking_retry_count < 3:
 
 重试的本质是注入一条"催促"消息，让模型继续，而不是重新发请求。
 
-**上下文压缩**：`ContextManager` 估算当前 token 数（字符数 ÷ 4），超过 95% 阈值时触发 `compact_messages()`，四阶段渐进压缩（见 Q8）。
+**上下文压缩**：`ContextManager` 估算当前 token 数（ CJK 字符 ÷ 1.5、ASCII 字符 ÷ 4 分别计算再相加），超过 95% 阈值时触发 `compact_messages()`，四阶段渐进压缩（见 Q8）。
 
 ---
 
@@ -319,22 +316,92 @@ Agent 线程：run_agent_turn() 执行，回调更新 state → 触发重绘
 
 **答：**
 
-三层防线：
+三层防线，代码分布在 `security/permissions.py` 和 `security/risk.py`。
 
-**第一层：路径白名单**。`PermissionManager` 记录允许的目录，每次文件操作前检查目标路径是否在 `cwd` 内（用 `Path.resolve()` 防止 `../../` 穿越）。
+---
 
-**第二层：操作分级**。`auto_mode.py` 把操作按风险分为 SAFE/LOW/MEDIUM/HIGH/DANGEROUS 五级：
+**第一层：路径白名单（`ensure_path_access`）**
+
+每次文件操作前调用 `_normalize_path`（内部用 `Path.resolve()` + LRU cache）把路径拍平，再用 `_is_within_directory` 判断是否在 `workspace_root` 内：
 
 ```python
-SAFE_TOOLS = {"read_file", "list_files", "grep_files"}  # 自动通过
-# run_command 运行 rm -rf 之类命令 → HIGH → 必须用户确认
+if _is_within_directory(self.workspace_root, normalized_target):
+    return  # cwd 内直接放行
 ```
 
-**第三层：用户审批 + 反馈**。危险操作弹审批窗口，用户可以：
-- 允许一次 / 本轮允许全部
-- **拒绝并给模型反馈**——用户写的拒绝理由会作为 `user` 消息注入对话，模型据此调整策略
+Windows 下用 `lower()` 做大小写不敏感比较，防止大小写绕过。cwd 外的路径按优先级依次查：`session_denied` → `session_allowed` → auto mode 评估 → 弹审批窗口。
 
-最后一个是关键：不只是阻止，而是把人的意图传回给模型。
+`allow_always` / `deny_always` 持久化写入 `permissions.json`（原子写，先写临时文件再 `os.replace`，防止写到一半崩掉）。
+
+---
+
+**第二层：操作分级（`AutoModeChecker.assess_risk`）**
+
+四种权限模式：
+
+| 模式 | 行为 |
+|---|---|
+| `DEFAULT` | 全部 prompt |
+| `AUTO` | 按风险智能判断 |
+| `PLAN` | 只允许 SAFE_TOOLS，其余全 block |
+| `BYPASS` | 全部 approve（危险） |
+
+AUTO 模式下的风险判断链：
+
+```
+SAFE_TOOLS（read_file / grep_files / list_files）
+    → approve，不弹窗
+
+run_command
+    → 匹配 DANGEROUS_PATTERNS（正则）→ block
+        r"rm\s+-rf\s+/"      # 删根目录
+        r"curl.*\|\s*sh"     # 下载执行
+        r"format\s+[a-zA-Z]:" # 格式化磁盘
+        r"powershell.*\biex\b" # PowerShell 远程执行
+    → 匹配 HIGH_RISK_COMMANDS（字符串）→ prompt
+        "rm -rf", "git reset --hard", "git push --force", "sudo" ...
+    → 其他 → approve
+
+edit_file / write_file
+    → 路径匹配敏感文件（.env / .git / node_modules）→ prompt
+    → 普通文件 → prompt（文件编辑默认不自动通过）
+```
+
+---
+
+**第三层：用户审批 + 反馈（`ensure_edit` 的 7 个选项）**
+
+文件编辑弹窗提供细粒度选项：
+
+```
+1. apply once            → session_allowed_edits.add(path)         仅此次
+2. allow this file / turn → turn_allowed_edits.add(path)           本轮有效
+3. allow all edits / turn → turn_allow_all_edits = True            本轮全放行
+4. always allow           → allowed_edit_patterns.add + persist()  永久
+5. reject once            → session_denied_edits.add(path)
+6. reject + send guidance → 抛异常，携带用户反馈文本              ← 关键
+7. always reject          → denied_edit_patterns.add + persist()
+```
+
+`begin_turn()` 每轮开始时清掉 `turn_allowed_edits`，保证"本轮允许"不跨轮生效。
+
+**选项 6 的实现**（`permissions.py`）：
+
+```python
+if decision == "deny_with_feedback":
+    guidance = str(result.get("feedback", "")).strip()
+    if guidance:
+        raise RuntimeError(f"Edit denied: {normalized_target}\nUser guidance: {guidance}")
+```
+
+`RuntimeError` 的 message 带着用户反馈，`loop.py` 捕获后把它作为 `tool_result`（`isError=True`）注入对话。模型下一轮读到"用户拒绝，原因是 XXX"，据此调整策略。**不只是阻止，而是把人的意图传回给模型。**
+
+---
+
+**额外：输入/输出层安全检查**
+
+- `detect_prompt_injection`：正则检测用户输入是否包含"ignore previous instructions"等注入模式，在 `USER_INPUT` hook 触发时检查
+- `classify_output_safety`：检测模型输出中是否包含 `rm -rf`、`DROP TABLE` 等危险内容，在 `ASSISTANT_OUTPUT` hook 触发时检查，仅 warning 不拦截
 
 ---
 
@@ -385,16 +452,158 @@ class HookEvent(str, Enum):
 | Project | `.mini-code-memory/` | 当前项目，可提交 git |
 | Local | `.mini-code-memory-local/` | 当前项目，不提交 |
 
-每条记忆是一个 JSON 文件，包含内容、标签、创建时间。启动时记忆被读出，相关的注入 system prompt。
+每个 scope 下有两个文件：`memory.json`（结构化元数据，含 usage_count、created_at 等）和 `MEMORY.md`（人可读版本，方便直接编辑和提交 git）。两者同步写入，都用原子写（先写临时文件再 `os.replace`）防止写到一半崩掉。
 
-**为什么 TF-IDF**：记忆条目可能几十上百条，不能全量注入（浪费 token）。TF-IDF 按用户当前问题与记忆内容的词频相关性打分，选出最相关的 Top-K 条注入。
+**记忆的保存策略：全部手动**。没有自动提取逻辑，`add_entry` 在整个 codebase 里调用次数为零。用户需要自己编辑 `MEMORY.md` 写入重要决策和项目规范，下次启动时被读取注入。
 
-```python
-# 核心打分：query 词的 TF × IDF 的点积
-score = sum(tf_doc[term] * idf[term] for term in query_tokens if term in tf_doc)
+**读取与注入流程**：
+
+启动时 `MemoryManager._load_all()` 读取三层记忆，通过 `get_relevant_context()` 格式化后传给 `build_system_prompt()`，注入 system prompt 末尾。优先级 LOCAL > PROJECT > USER，总 token 上限 8000，超出只取最新条目。
+
+**为什么 TF-IDF**：记忆条目可能几十上百条，不能全量注入（浪费 token）。TF-IDF 按相关性打分，`search()` 的总分由四部分组成：
+
+```
+总分 = TF-IDF 相关度
+     + substring_score   # 完整包含查询词 +2.0，部分包含 +1.0
+     + tag_score         # tag/category 命中 +1.5/+1.0
+     + log(usage_count) × 0.3   # 被用得多的优先
+     + 1/(1 + age/24h) × 0.5    # 越新越优先
 ```
 
-不用 embedding 向量检索的原因：纯本地运行，不依赖外部 API，TF-IDF 对几百条短文本已经足够准确。
+score=0 的条目直接丢弃，剩下按分排序取 Top-K。不用 embedding 向量检索的原因：纯本地运行，不依赖外部 API，TF-IDF 对几百条短文本已经足够准确。
+
+---
+
+### Q16：Session 持久化是怎么工作的？跨对话如何恢复上下文？
+
+**答：**
+
+这是"对上轮对话有记忆"的真正实现，与记忆系统完全不同，代码在 `session/core.py`。
+
+**存储内容**（`SessionData`）：
+
+| 字段 | 内容 |
+|---|---|
+| `messages` | 完整对话历史（所有 user/assistant/tool 消息） |
+| `transcript_entries` | TUI 显示条目（UI 状态） |
+| `history` | 用户输入历史（上下键翻历史） |
+| `workspace` | 启动时的工作目录 |
+
+存在 `~/.mini-code/sessions/<session_id>.json`，另有 `sessions_index.json` 作为轻量索引（只含元数据，不含消息体），支持快速列出所有 session。
+
+**文件结构**：
+
+一个 session 一个独立文件，按 session_id 命名：
+
+```
+~/.mini-code/
+├── sessions/
+│   ├── abc123.json          ← session 1 完整数据
+│   ├── def456.json          ← session 2 完整数据
+│   └── deltas/
+│       ├── abc123/
+│       │   ├── delta_0001.json
+│       │   └── delta_0002.json
+│       └── def456/
+│           └── delta_0001.json
+└── sessions_index.json      ← 所有 session 的轻量元数据索引
+```
+
+`sessions_index.json` 只存元数据（session_id、workspace、时间、首条消息摘要），不存消息体，用于快速列出所有 session 而不必逐个读大文件。
+
+**Session 的粒度**：
+
+每次启动 minicode 进程就创建一个新 session（`uuid4().hex[:12]` 生成随机 ID）。恢复时按 `workspace` 过滤，`get_latest_session(workspace)` 从 index 里找出当前项目最新的 session 加载，两个项目的历史完全隔离不会串。
+
+**增量保存策略（减少 I/O 开销）**：
+
+`AutosaveManager` 每 30 秒触发一次，采用 delta + full 混合策略：
+
+```
+delta save（快）：只追加新消息到 deltas/delta_0001.json
+    ↓ 每 10 次 delta 或强制保存
+full save（慢）：序列化完整 session 到主文件，清理所有 delta 文件
+```
+
+设计动机：每轮对话只新增几条消息，全量序列化是浪费。delta 只记增量，I/O 极小；定期 full save 保证主文件一致，delta 文件不会无限增长（上限 50 个）。
+
+**恢复流程**（`load_session`）：
+
+```
+1. 读主 session.json（完整基础数据）
+2. 扫描 deltas/ 目录，按 delta_0001、delta_0002... 顺序 apply
+3. 合并时处理重叠（offset 机制防止重复追加）
+4. 把 messages 全量加载进内存，传给 Agent 继续对话
+```
+
+**文件大小控制**：
+
+历史消息全部加载进内存后，若 token 超过 95% 阈值，上下文压缩（`compact_messages`）会在内存中裁减老消息。压缩结果在下次 autosave 时写回 session 文件，文件反而会缩小。压缩是不可逆的，被删消息只剩 compaction marker 里的摘要。
+
+session 总数量上限是 50 个（`cleanup_old_sessions`），超出时删最老的，但该函数目前没有被自动调用，属于未接入的功能。
+
+**与记忆系统的区别**：
+
+| | Session 持久化 | 记忆系统（MEMORY.md） |
+|---|---|---|
+| 存什么 | 完整对话消息列表 | 手动写的知识/规范条目 |
+| 范围 | 单次 session，恢复后继续 | 跨所有 session 长期有效 |
+| 注入位置 | 直接作为 messages 传模型 | 注入 system prompt |
+| 自动化 | 全自动，30s 一次 | 手动编辑文件 |
+| token 消耗 | 受上下文压缩控制 | 上限 8000 token |
+
+---
+
+### Q17：System Prompt 是怎么构造的？
+
+**答：**
+
+入口是 `build_system_prompt()`（`session/prompt.py`），用 `PromptPipeline` 分两段组装：
+
+**静态前缀（Cacheable，每轮不变）**：
+
+- 角色定义："你是 mini-code，一个终端编程助手"
+- 行为规则：优先用工具而非纯理论、何时用 `ask_user`
+- `<progress>` / `<final>` 响应协议：模型仍在工作时输出 `<progress>`，完成后输出 `<final>`
+- sub-agent 使用指南：何时用 `task` 工具派生子 Agent
+
+静态部分内容不变，可命中 API prompt cache，节省 token 费用。
+
+**动态后缀（Per-turn，每轮重新计算）**：
+
+| 内容 | 来源 | cache_ttl |
+|---|---|---|
+| 权限摘要（cwd、允许目录） | `PermissionManager.get_summary()` | 无 |
+| 可用 Skills 列表 | `tools.get_skills()` | 无 |
+| MCP servers 状态 | `tools.get_mcp_servers()` | 60s |
+| `~/.claude/CLAUDE.md` | 全局用户指令 | 600s |
+| `./CLAUDE.md` | 项目指令 | 300s |
+| 记忆上下文 | `memory_mgr.get_relevant_context()` | 无 |
+
+**最终 system message 结构**：
+
+```
+[角色定义 + 行为规则 + 响应协议]  ← 静态，可缓存
+[权限摘要]
+[Skills 列表]
+[MCP servers 状态]
+[~/.claude/CLAUDE.md 内容]
+[./CLAUDE.md 内容]
+[记忆上下文（来自 MEMORY.md）]   ← 动态，每轮重算
+```
+
+组装入口（`main.py`）：
+
+```python
+def _build_system_message(cwd, permissions, tools, memory_mgr=None):
+    extras = {
+        "skills": tools.get_skills(),
+        "mcpServers": tools.get_mcp_servers(),
+    }
+    if memory_mgr:
+        extras["memory_context"] = memory_mgr.get_relevant_context()
+    return {"role": "system", "content": build_system_prompt(cwd, permissions.get_summary(), extras)}
+```
 
 ---
 

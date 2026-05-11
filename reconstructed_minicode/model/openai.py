@@ -112,6 +112,50 @@ def _to_openai_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[
     return system_message, converted
 
 
+def _extract_xml_tool_calls(text: str) -> list[dict]:
+    """Extract tool calls from XML-style output that GLM sometimes emits.
+
+    Handles patterns like:
+        </think><think>tool_name\n<arg_key>k</arg_key>\n<arg_value>v</arg_value>
+        tool_name\n<arg_key>k</arg_key>\n<arg_value>v</arg_value>\n</tool_call>
+    """
+    import re as _re
+    # Strip think tags so the tool name is directly matchable
+    cleaned = _re.sub(r'</?think>', '', text)
+    calls = []
+    # Match: tool name on its own line, followed by key/value pairs
+    pattern = _re.compile(
+        r'(?:(?:^|\n)\s*)'                   # line start
+        r'([a-z_][a-z0-9_]*)\s*\n'           # tool name
+        r'((?:\s*<arg_key>[^<]+</arg_key>\s*\n\s*<arg_value>[^<]*</arg_value>\s*\n?)+)',
+        _re.MULTILINE,
+    )
+    kv_pat = _re.compile(
+        r'<arg_key>([^<]+)</arg_key>\s*\n\s*<arg_value>([^<]*)</arg_value>',
+        _re.DOTALL,
+    )
+    for m in pattern.finditer(cleaned):
+        tool_name = m.group(1).strip()
+        kv_block = m.group(2)
+        args = {}
+        for kv in kv_pat.finditer(kv_block):
+            k = kv.group(1).strip()
+            v = kv.group(2).strip()
+            # Try to parse value as JSON (handles numbers, bools, etc.)
+            try:
+                import json as _json
+                args[k] = _json.loads(v)
+            except Exception:
+                args[k] = v
+        if tool_name and args:
+            calls.append({
+                "id": f"xml_{len(calls)}",
+                "toolName": tool_name,
+                "input": args,
+            })
+    return calls
+
+
 def _parse_assistant_text(content: str) -> tuple[str, str | None]:
     """Parse progress/final markers from assistant text."""
     trimmed = content.strip()
@@ -179,6 +223,15 @@ class OpenAIModelAdapter:
         
         if self.runtime.get("maxOutputTokens") is not None:
             request_body["max_tokens"] = self.runtime["maxOutputTokens"]
+
+        # Limit thinking budget for models that support it (e.g. GLM-4.5-air)
+        # Prevents >10min API timeouts from unbounded thinking chains
+        thinking_budget = self.runtime.get("thinkingBudgetTokens")
+        if thinking_budget is not None:
+            request_body["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": int(thinking_budget),
+            }
         
         if on_stream_chunk:
             request_body["stream"] = True
@@ -204,8 +257,8 @@ class OpenAIModelAdapter:
             if v is not None:
                 request_body[k] = v
 
-        # Avoid double /v1 when base_url already ends with /v1
-        if base_url.endswith("/v1"):
+        # Avoid double path segment when base_url already ends with /v1 or /v4
+        if base_url.endswith("/v1") or base_url.endswith("/v4"):
             completions_url = f"{base_url}/chat/completions"
         else:
             completions_url = f"{base_url}/v1/chat/completions"
@@ -221,7 +274,7 @@ class OpenAIModelAdapter:
         response = None
         for attempt in range(max_retries + 1):
             try:
-                response = urllib.request.urlopen(request, timeout=120)  # noqa: S310
+                response = urllib.request.urlopen(request, timeout=600)  # noqa: S310
                 break
             except urllib.error.HTTPError as error:
                 response = error
@@ -289,6 +342,12 @@ class OpenAIModelAdapter:
                         "input": parsed_input,
                     })
             
+            # Fall back to XML tool call extraction if model used wrong format
+            if not tool_calls and text_content:
+                xml_calls = _extract_xml_tool_calls(text_content)
+                if xml_calls:
+                    tool_calls = xml_calls
+
             parsed_text, kind = _parse_assistant_text(text_content.strip())
             diagnostics = StepDiagnostics(
                 stopReason=stop_reason,
@@ -405,7 +464,14 @@ class OpenAIModelAdapter:
                 store.set_state(add_cost(cost_usd))
             store.set_state(update_context_usage(stream_input_tokens + stream_output_tokens))
         
-        parsed_text, kind = _parse_assistant_text("".join(text_parts).strip())
+        # Fall back to XML tool call extraction if model used wrong format
+        full_text = "".join(text_parts)
+        if not tool_calls and full_text:
+            xml_calls = _extract_xml_tool_calls(full_text)
+            if xml_calls:
+                tool_calls = xml_calls
+
+        parsed_text, kind = _parse_assistant_text(full_text.strip())
         diagnostics = StepDiagnostics(
             stopReason=stop_reason,
             blockTypes=["tool_calls"] if tool_calls else (["text"] if text_parts else []),

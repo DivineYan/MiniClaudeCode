@@ -322,8 +322,166 @@ def _run_get_ast_info(input_data: dict, context) -> ToolResult:
 
 
 # ---------------------------------------------------------------------------
+# get_outline helpers
+# ---------------------------------------------------------------------------
+
+def _fmt_args(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    args = node.args
+    parts = [a.arg for a in args.args]
+    if args.vararg:
+        parts.append(f"*{args.vararg.arg}")
+    if args.kwarg:
+        parts.append(f"**{args.kwarg.arg}")
+    return ", ".join(parts)
+
+
+def _outline_file(target: Path) -> str:
+    try:
+        content = target.read_text(encoding="utf-8")
+        tree = ast.parse(content, filename=str(target))
+    except SyntaxError as e:
+        return f"Syntax error: {e}"
+    except UnicodeDecodeError:
+        return "Binary or non-UTF-8 file."
+
+    total_lines = len(content.splitlines())
+    rows: list[str] = [f"{target.name}  ({total_lines} lines)", ""]
+
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            prefix = "async def " if isinstance(node, ast.AsyncFunctionDef) else "def "
+            rows.append(f"  {node.lineno:4d}:  {prefix}{node.name}({_fmt_args(node)})")
+        elif isinstance(node, ast.ClassDef):
+            bases = f"({', '.join(ast.unparse(b) for b in node.bases)})" if node.bases else ""
+            rows.append(f"  {node.lineno:4d}:  class {node.name}{bases}:")
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    prefix = "async def " if isinstance(child, ast.AsyncFunctionDef) else "def "
+                    rows.append(f"  {child.lineno:4d}:      {prefix}{child.name}({_fmt_args(child)})")
+
+    return "\n".join(rows)
+
+
+def _validate_get_outline(input_data: dict) -> dict:
+    path = input_data.get("path")
+    if not isinstance(path, str) or not path:
+        raise ValueError("path is required")
+    return {"path": path}
+
+
+def _run_get_outline(input_data: dict, context) -> ToolResult:
+    target = Path(context.cwd) / input_data["path"]
+    if not target.exists():
+        return ToolResult(ok=False, output=f"File not found: {target}")
+    if not target.is_file():
+        return ToolResult(ok=False, output="path must be a file, not a directory. Use find_definition to search across a directory.")
+    return ToolResult(ok=True, output=_outline_file(target))
+
+
+# ---------------------------------------------------------------------------
+# find_definition helpers
+# ---------------------------------------------------------------------------
+
+SKIP_DIRS = frozenset({
+    ".git", "node_modules", "__pycache__", ".venv", "venv", ".tox",
+    "dist", "build", ".hg", ".svn", ".next", ".nuxt", "target",
+    "vendor", ".dart_tool", ".gradle", ".idea", ".vscode",
+    "coverage", ".coverage", "htmlcov", ".mypy_cache", ".pytest_cache",
+    ".ruff_cache",
+})
+
+
+def _find_defs_in_file(target: Path, name: str) -> list[tuple[int, str]]:
+    try:
+        content = target.read_text(encoding="utf-8")
+        tree = ast.parse(content, filename=str(target))
+    except (SyntaxError, UnicodeDecodeError, OSError):
+        return []
+
+    hits: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            prefix = "async def " if isinstance(node, ast.AsyncFunctionDef) else "def "
+            hits.append((node.lineno, f"{prefix}{node.name}({_fmt_args(node)})"))
+        elif isinstance(node, ast.ClassDef) and node.name == name:
+            bases = f"({', '.join(ast.unparse(b) for b in node.bases)})" if node.bases else ""
+            hits.append((node.lineno, f"class {node.name}{bases}:"))
+    return hits
+
+
+def _validate_find_definition(input_data: dict) -> dict:
+    name = input_data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("name is required")
+    return {"name": name.strip(), "path": input_data.get("path", ".")}
+
+
+def _run_find_definition(input_data: dict, context) -> ToolResult:
+    name = input_data["name"]
+    search_root = Path(context.cwd) / input_data["path"]
+
+    if not search_root.exists():
+        return ToolResult(ok=False, output=f"Path not found: {search_root}")
+
+    py_files: list[Path] = (
+        [search_root] if search_root.is_file()
+        else [
+            p for p in search_root.rglob("*.py")
+            if not any(part in SKIP_DIRS or part.startswith(".") for part in p.relative_to(search_root).parts)
+        ]
+    )
+
+    rows: list[str] = []
+    for py_file in sorted(py_files):
+        for lineno, signature in _find_defs_in_file(py_file, name):
+            rel = py_file.relative_to(context.cwd).as_posix()
+            rows.append(f"{rel}:{lineno}:  {signature}")
+
+    if not rows:
+        return ToolResult(ok=True, output=f"No definition of '{name}' found.")
+    return ToolResult(ok=True, output="\n".join(rows))
+
+
+# ---------------------------------------------------------------------------
 # Tool Definitions
 # ---------------------------------------------------------------------------
+
+get_outline_tool = ToolDefinition(
+    name="get_outline",
+    description=(
+        "Show the top-level structure of a Python file: all functions and classes with "
+        "their line numbers and signatures. Use this before read_file to find the exact "
+        "line to start reading from, so you don't have to read the whole file."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path to a Python file (relative to workspace root)"},
+        },
+        "required": ["path"],
+    },
+    validator=_validate_get_outline,
+    run=_run_get_outline,
+)
+
+find_definition_tool = ToolDefinition(
+    name="find_definition",
+    description=(
+        "Find where a function or class is DEFINED (not just referenced) across Python files. "
+        "Returns file:line and the full signature. Use this when grep_files returns too many "
+        "call-sites and you only want the definition."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Exact function or class name to find"},
+            "path": {"type": "string", "description": "Directory to search (default: workspace root)"},
+        },
+        "required": ["name"],
+    },
+    validator=_validate_find_definition,
+    run=_run_find_definition,
+)
 
 find_symbols_tool = ToolDefinition(
     name="find_symbols",

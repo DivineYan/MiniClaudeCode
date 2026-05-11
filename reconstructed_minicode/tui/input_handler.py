@@ -385,7 +385,7 @@ def _handle_input(
 
     def on_assistant_message(content: str) -> None:
         nonlocal active_stream_entry_id
-        # Hook: assistant output
+        # Hook: assistant output （截取前 500 字符传出去。）
         fire_hook_sync(HookEvent.ASSISTANT_OUTPUT, assistant_output=content[:500])
         # Output safety check (output layer)
         from reconstructed_minicode.security.risk import AutoModeChecker

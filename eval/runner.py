@@ -1,118 +1,77 @@
 """SWE-bench evaluation runner for MiniCode.
 
 Usage:
-    python eval/runner.py --instances eval/instances.jsonl --label baseline --n 5
-    python eval/runner.py --instances eval/instances.jsonl --label focus --n 5
-    python eval/runner.py --compare eval/results/baseline.json eval/results/focus.json
+    python eval/runner.py run --instances eval/instances.jsonl --label baseline --n 5
+    python eval/runner.py merge --label baseline --swebench eval/results/swebench.json
+    python eval/runner.py compare eval/results/baseline.json eval/results/focus.json
 
-Instances file: one JSON object per line (SWE-bench Lite format).
+Patches are saved to eval/predictions/<label>.jsonl for upload to swebench.com.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 import time
-import tempfile
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from eval.env import clone_repo, apply_patch, check_tests_pass
+from eval.env import clone_repo
 from eval.metrics import EvalRun, TaskResult, print_comparison
-from reconstructed_minicode.agent.context import estimate_messages_tokens
 
 
-# ---------------------------------------------------------------------------
-# Instrumented agent runner
-# ---------------------------------------------------------------------------
-
-def _run_agent_on_instance(
-    instance: dict[str, Any],
-    repo_path: Path,
-    runtime: dict,
-) -> tuple[str, int, int, int, int]:
-    """Run MiniCode agent on a SWE-bench instance.
-
-    Returns: (patch, tokens_used, compressions, messages_dropped, turns)
-    """
-    from reconstructed_minicode.agent.loop import run_agent_turn
-    from reconstructed_minicode.agent.context import ContextManager
-    from reconstructed_minicode.model.registry import create_model_adapter
-    from reconstructed_minicode.security.permissions import PermissionManager
-    from reconstructed_minicode.tools import create_default_tool_registry
-
-    cwd = str(repo_path)
-    tools = create_default_tool_registry(cwd, runtime=runtime)
-    model = create_model_adapter(
-        model=runtime.get("model", ""),
-        tools=tools,
-        runtime=runtime,
+def _run_on_instance(instance: dict[str, Any], repo_path: Path) -> tuple[str, int, int, int, int]:
+    from reconstructed_minicode.cli.headless import run_headless
+    prompt = (
+        "Fix the following GitHub issue by editing the source code directly. Hints are important.\n"
+        "\n"
+        "Rules:\n"
+        "- Before editing, read the relevant test file to understand the exact expected behavior.\n"
+        "- A bug often requires edits in MORE THAN ONE place. After each fix, re-read the entire\n"
+        "  function/file to find other instances of the same bug pattern.\n"
+        "- Check related methods: if method A is broken, check sibling methods B and C too.\n"
+        "- Do NOT modify test files — only fix source code.\n"
+        "- Do not use web_search — all information is in the local codebase.\n"
+        "- Do not run any shell commands or test scripts.\n"
+        "\n"
+        + instance["problem_statement"]
     )
-    context_manager = ContextManager(model=runtime.get("model", "default"))
-    permissions = PermissionManager(cwd, prompt=None)  # auto-approve for eval
+    hints = instance.get("hints_text", "").strip()
+    if hints:
+        prompt += f"\n\n--- Hints ---\n{hints}"
 
-    system_prompt = (
-        "You are an expert software engineer. "
-        "Solve the GitHub issue described below by editing the repository files. "
-        "When done, summarize what you changed."
-    )
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": instance["problem_statement"]},
-    ]
+    orig_cwd = os.getcwd()
+    os.chdir(str(repo_path))
+    os.environ["MINI_CODE_BYPASS_PERMISSIONS"] = "1"
+    try:
+        result = run_headless(prompt, verbose=True)
+    finally:
+        os.chdir(orig_cwd)
+        os.environ.pop("MINI_CODE_BYPASS_PERMISSIONS", None)
 
-    tokens_before = estimate_messages_tokens(messages)
-    turns_taken = 0
-    on_turn = lambda: None
+    diff = subprocess.run(["git", "diff"], cwd=str(repo_path), capture_output=True)
+    patch = diff.stdout.decode("utf-8", errors="replace")
 
-    def count_turn(*_):
-        nonlocal turns_taken
-        turns_taken += 1
+    return patch, result.tokens_used, result.compression_count, result.messages_dropped, result.turns
 
-    result_messages = run_agent_turn(
-        model=model,
-        tools=tools,
-        messages=messages,
-        cwd=cwd,
-        permissions=permissions,
-        context_manager=context_manager,
-        runtime=runtime,
-        on_assistant_message=count_turn,
-        max_steps=30,
-    )
-
-    tokens_used = estimate_messages_tokens(result_messages)
-
-    # Collect compaction stats
-    compressions = len(context_manager.compaction_history)
-    messages_dropped = sum(
-        h.get("messages_removed", 0) for h in context_manager.compaction_history
-    )
-
-    # Get the diff of what was changed
-    import subprocess
-    diff_result = subprocess.run(
-        ["git", "diff"], cwd=cwd, capture_output=True
-    )
-    patch = diff_result.stdout.decode("utf-8", errors="replace")
-
-    return patch, tokens_used, compressions, messages_dropped, turns_taken
-
-
-# ---------------------------------------------------------------------------
-# Main eval loop
-# ---------------------------------------------------------------------------
 
 def run_eval(
     instances: list[dict[str, Any]],
     label: str,
-    runtime: dict,
     output_path: Path,
+    predictions_path: Path,
     workdir: Path,
 ) -> EvalRun:
-    run = EvalRun(label=label, model=runtime.get("model", "unknown"))
+    from reconstructed_minicode.config import load_runtime_config
+    runtime = load_runtime_config()
+    model = runtime.get("model", "unknown")
+
+    run = EvalRun(label=label, model=model)
+    predictions: list[dict] = []
 
     for i, instance in enumerate(instances):
         iid = instance["instance_id"]
@@ -120,30 +79,14 @@ def run_eval(
 
         start = time.time()
         error = None
-        success = False
         patch = ""
-        tokens = 0
-        compressions = 0
-        dropped = 0
-        turns = 0
+        tokens = compressions = dropped = turns = 0
 
         repo_path = None
         try:
             repo_path = clone_repo(instance["repo"], instance["base_commit"], workdir)
-
-            patch, tokens, compressions, dropped, turns = _run_agent_on_instance(
-                instance, repo_path, runtime
-            )
-            print(f"  patch: {len(patch)} chars | tokens: {tokens:,} | "
-                  f"compressions: {compressions} | dropped: {dropped}")
-
-            if patch.strip():
-                apply_patch(repo_path, patch)
-
-            import json as _json
-            fail_to_pass = _json.loads(instance.get("FAIL_TO_PASS", "[]"))
-            success = check_tests_pass(repo_path, fail_to_pass)
-            print(f"  success: {success}")
+            patch, tokens, compressions, dropped, turns = _run_on_instance(instance, repo_path)
+            print(f"  patch: {len(patch)} chars")
 
         except KeyboardInterrupt:
             print("  Interrupted.")
@@ -153,106 +96,105 @@ def run_eval(
             print(f"  ERROR: {error}")
 
         finally:
-            # Reset repo for next run
             if repo_path and repo_path.exists():
-                import subprocess
-                subprocess.run(
-                    ["git", "checkout", "."],
-                    cwd=str(repo_path), capture_output=True,
-                )
+                subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=str(repo_path), capture_output=True)
+                subprocess.run(["git", "clean", "-fd"], cwd=str(repo_path), capture_output=True)
 
         run.results.append(TaskResult(
             instance_id=iid,
-            success=success,
             tokens_used=tokens,
             compression_count=compressions,
             messages_dropped=dropped,
             turns=turns,
             duration_seconds=time.time() - start,
             error=error,
-            patch_generated=patch[:2000],  # truncate for storage
+            patch_generated=patch[:2000],
         ))
+        predictions.append({
+            "instance_id": iid,
+            "model_patch": patch,
+            "model_name_or_path": model,
+        })
 
         run.save(output_path)
+        _save_jsonl(predictions, predictions_path)
         print(f"  saved → {output_path}")
 
     return run
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+def _save_jsonl(rows: list[dict], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def merge_results(label: str, results_dir: Path, swebench_path: Path) -> None:
+    metrics_path = results_dir / f"{label}.json"
+    run = EvalRun.load(metrics_path)
+    raw = json.loads(swebench_path.read_text(encoding="utf-8"))
+    resolved = set(raw) if isinstance(raw, list) else {k for k, v in raw.items() if v}
+    updated = 0
+    for r in run.results:
+        if r.instance_id in resolved or r.instance_id in raw:
+            r.success = r.instance_id in resolved if isinstance(raw, list) else bool(raw.get(r.instance_id))
+            updated += 1
+    run.save(metrics_path)
+    print(f"Updated {updated}/{run.n} | success: {sum(r.success for r in run.results if r.success)}/{run.n}")
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="SWE-bench eval runner for MiniCode")
+    parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd")
 
-    run_p = sub.add_parser("run", help="Run evaluation")
-    run_p.add_argument("--instances", required=True, help="Path to .jsonl file")
-    run_p.add_argument("--label", required=True, help="Run label, e.g. 'baseline'")
-    run_p.add_argument("--n", type=int, default=5, help="Number of instances to evaluate")
-    run_p.add_argument("--output", default="eval/results", help="Output directory")
-    run_p.add_argument("--workdir", default="eval/repos", help="Temp dir for cloned repos")
-    run_p.add_argument("--model", default=None, help="Override model")
+    run_p = sub.add_parser("run")
+    run_p.add_argument("--instances", required=True)
+    run_p.add_argument("--label", required=True)
+    run_p.add_argument("--n", type=int, default=5)
+    run_p.add_argument("--offset", type=int, default=0)
+    run_p.add_argument("--output", default="eval/results")
+    run_p.add_argument("--workdir", default="eval/repos")
 
-    cmp_p = sub.add_parser("compare", help="Compare two eval runs")
-    cmp_p.add_argument("baseline", help="Path to baseline results JSON")
-    cmp_p.add_argument("focus", help="Path to focus results JSON")
+    merge_p = sub.add_parser("merge")
+    merge_p.add_argument("--label", required=True)
+    merge_p.add_argument("--swebench", required=True)
+    merge_p.add_argument("--output", default="eval/results")
+
+    cmp_p = sub.add_parser("compare")
+    cmp_p.add_argument("baseline")
+    cmp_p.add_argument("focus")
 
     args = parser.parse_args()
 
     if args.cmd == "compare":
-        from eval.metrics import EvalRun, print_comparison
-        baseline = EvalRun.load(Path(args.baseline))
-        focus = EvalRun.load(Path(args.focus))
-        print_comparison(baseline, focus)
-        return
+        print_comparison(EvalRun.load(Path(args.baseline)), EvalRun.load(Path(args.focus)))
 
-    if args.cmd == "run":
-        instances_path = Path(args.instances)
-        instances = []
-        with open(instances_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    instances.append(json.loads(line))
-        instances = instances[: args.n]
+    elif args.cmd == "merge":
+        merge_results(args.label, Path(args.output), Path(args.swebench))
 
-        # Load runtime config
-        config_path = Path.home() / ".mini-code" / "settings.json"
-        runtime = {}
-        if config_path.exists():
-            try:
-                settings = json.loads(config_path.read_text(encoding="utf-8"))
-                runtime = {
-                    "model": args.model or settings.get("model", ""),
-                    **{k: v for k, v in settings.get("env", {}).items()},
-                }
-            except Exception:
-                pass
-        if args.model:
-            runtime["model"] = args.model
+    elif args.cmd == "run":
+        with open(args.instances, encoding="utf-8") as f:
+            instances = [json.loads(l) for l in f if l.strip()]
+        instances = instances[args.offset: args.offset + args.n]
 
         output_dir = Path(args.output)
         output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"{args.label}.json"
+        Path(args.workdir).mkdir(parents=True, exist_ok=True)
 
-        workdir = Path(args.workdir)
-        workdir.mkdir(parents=True, exist_ok=True)
-
-        run = run_eval(instances, args.label, runtime, output_path, workdir)
-
-        print(f"\n{'='*55}")
-        print(f"  {args.label}: {run.n} tasks")
-        print(f"  Success: {sum(r.success for r in run.results)}/{run.n} ({run.task_success_rate*100:.0f}%)")
-        print(f"  Total tokens: {run.total_tokens:,}")
-        print(f"  Avg tokens/task: {run.avg_tokens_per_task:,.0f}")
-        print(f"  Avg compressions: {run.avg_compressions:.1f}")
-        print(f"  Avg msgs dropped: {run.avg_messages_dropped:.1f}")
-        print(f"{'='*55}")
-        return
-
-    parser.print_help()
+        run = run_eval(
+            instances=instances,
+            label=args.label,
+            output_path=output_dir / f"{args.label}.json",
+            predictions_path=Path("eval/predictions") / f"{args.label}.jsonl",
+            workdir=Path(args.workdir),
+        )
+        print(f"\n{'='*50}")
+        print(f"  {args.label}: {run.n} tasks | tokens: {run.total_tokens:,}")
+        print(f"  Upload eval/predictions/{args.label}.jsonl → swebench.com")
+        print(f"{'='*50}")
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":

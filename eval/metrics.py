@@ -11,14 +11,14 @@ from typing import Any
 @dataclass
 class TaskResult:
     instance_id: str
-    success: bool                    # FAIL_TO_PASS all passed
-    tokens_used: int                 # estimated total tokens consumed
-    compression_count: int           # how many times compaction triggered
-    messages_dropped: int            # total messages removed by compaction
-    turns: int                       # agent loop iterations
+    tokens_used: int
+    compression_count: int
+    messages_dropped: int
+    turns: int
     duration_seconds: float
-    error: str | None = None         # if agent crashed
-    patch_generated: str = ""        # the diff MiniCode produced
+    success: bool | None = None      # None until merged from swebench.com
+    error: str | None = None
+    patch_generated: str = ""
 
 
 @dataclass
@@ -35,9 +35,10 @@ class EvalRun:
 
     @property
     def task_success_rate(self) -> float:
-        if not self.results:
+        scored = [r for r in self.results if r.success is not None]
+        if not scored:
             return 0.0
-        return sum(1 for r in self.results if r.success) / len(self.results)
+        return sum(1 for r in scored if r.success) / len(scored)
 
     @property
     def total_tokens(self) -> int:

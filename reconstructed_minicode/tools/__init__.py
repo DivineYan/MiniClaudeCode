@@ -9,7 +9,7 @@ from reconstructed_minicode.tools.archive_utils import (
     zip_create_tool, zip_extract_tool,
 )
 from reconstructed_minicode.tools.batch_ops import batch_copy_tool, batch_move_tool, batch_delete_tool
-from reconstructed_minicode.tools.code_nav import find_symbols_tool, find_references_tool, get_ast_info_tool
+from reconstructed_minicode.tools.code_nav import find_symbols_tool, find_references_tool, get_ast_info_tool, get_outline_tool, find_definition_tool
 from reconstructed_minicode.tools.code_review import code_review_tool
 from reconstructed_minicode.tools.crypto_utils import current_time_tool, timestamp_tool, hash_tool, hmac_tool
 from reconstructed_minicode.tools.csv_utils import csv_parse_tool, csv_create_tool
@@ -104,6 +104,8 @@ def create_default_tool_registry(cwd: str, runtime: dict | None = None) -> ToolR
             # Git workflow
             git_tool,
             # Code intelligence
+            get_outline_tool,
+            find_definition_tool,
             find_symbols_tool,
             find_references_tool,
             get_ast_info_tool,

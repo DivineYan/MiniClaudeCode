@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(D:/Python/envs/agent_project/python.exe -c ' *)"
+    ]
+  }
+}

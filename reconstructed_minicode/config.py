@@ -223,6 +223,19 @@ def load_runtime_config(cwd: str | Path | None = None) -> dict[str, Any]:
         or user_preferences.get("verbosity", "")
     )
 
+    raw_thinking_budget = (
+        os.environ.get("MINI_CODE_THINKING_BUDGET_TOKENS")
+        or effective.get("thinkingBudgetTokens")
+    )
+    thinking_budget_tokens = None
+    if raw_thinking_budget is not None:
+        try:
+            parsed = int(raw_thinking_budget)
+            if parsed > 0:
+                thinking_budget_tokens = parsed
+        except (TypeError, ValueError):
+            pass
+
     return {
         "model": model,
         "baseUrl": base_url,
@@ -235,6 +248,7 @@ def load_runtime_config(cwd: str | Path | None = None) -> dict[str, Any]:
         "customBaseUrl": custom_base_url,
         "customApiKey": custom_api_key,
         "maxOutputTokens": max_output_tokens,
+        "thinkingBudgetTokens": thinking_budget_tokens,
         "mcpServers": effective.get("mcpServers", {}),
         "globalUserProfilePath": str(global_user_profile),
         "projectUserProfilePath": str(proj_user_profile),

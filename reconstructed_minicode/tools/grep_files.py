@@ -216,7 +216,7 @@ def _validate(input_data: dict) -> dict:
         "path": input_data.get("path", "."),
         "include": include,
         "exclude": exclude,
-        "context_lines": min(int(input_data.get("context_lines", 0)), 5),
+        "context_lines": min(int(input_data.get("context_lines", 5)), 20),
         "case_sensitive": bool(input_data.get("case_sensitive", False)),
     }
 
@@ -236,12 +236,15 @@ def _run(input_data: dict, context) -> ToolResult:
     exclude_globs = input_data.get("exclude", [])
     
     # Collect files
-    try:
-        all_files = sorted(root.rglob("*"))
-    except PermissionError:
-        return ToolResult(ok=False, output=f"Permission denied: {root}")
-    except OSError as e:
-        return ToolResult(ok=False, output=f"Cannot read directory: {e}")
+    if root.is_file():
+        all_files = [root]
+    else:
+        try:
+            all_files = sorted(root.rglob("*"))
+        except PermissionError:
+            return ToolResult(ok=False, output=f"Permission denied: {root}")
+        except OSError as e:
+            return ToolResult(ok=False, output=f"Cannot read directory: {e}")
     
     # Search
     results: list[tuple[Path, list[dict[str, Any]]]] = []
@@ -333,9 +336,9 @@ grep_files_tool = ToolDefinition(
             },
             "context_lines": {
                 "type": "integer",
-                "description": "Number of context lines before and after each match (0-5, default: 0)",
+                "description": "Lines of context before and after each match (default: 5, max: 20). Use 10-20 to see full function bodies without needing read_file.",
                 "minimum": 0,
-                "maximum": 5,
+                "maximum": 20,
             },
             "case_sensitive": {
                 "type": "boolean",

@@ -48,6 +48,12 @@ NUDGE_REPEATED_FAILURE = (
     "failing with the same error. Stop retrying. Read the file at the relevant lines "
     "to see the actual content, then construct a corrected call based on what you see."
 )
+NUDGE_REPEATED_SAME_SEARCH = (
+    "You have run the exact same {tool_name} call {count} times and gotten the same "
+    "result every time. This search is not yielding new information — stop repeating it. "
+    "Try a different search term, use get_outline or list_files to explore the structure, "
+    "or re-read the problem statement to reconsider your approach."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +330,7 @@ def run_agent_turn(
     cwd: str,
     permissions: PermissionManager | None = None,
     store: Store[AppState] | None = None,
-    max_steps: int = 50,
+    max_steps: int = 60,
     on_tool_start: Callable[[str, dict], None] | None = None,
     on_tool_result: Callable[[str, str, bool], None] | None = None,
     on_assistant_message: Callable[[str], None] | None = None,
@@ -339,9 +345,9 @@ def run_agent_turn(
     thinking_retry = 0
     tool_error_count = 0
     step = 0
-    # Loop detection: track consecutive identical failed tool calls
-    _last_failed_call_key: str | None = None
-    _consecutive_fail_count: int = 0
+    # Loop detection: track total frequency of each call key within this turn
+    _call_freq: dict[str, int] = {}
+    _nudged_keys: set[str] = set()
 
     if context_manager:
         current_messages = _maybe_compact(context_manager, current_messages, on_assistant_message)
@@ -457,23 +463,20 @@ def run_agent_turn(
                 saw_tool_result = True
                 if not result.ok:
                     tool_error_count += 1
-                    call_key = f"{call['toolName']}:{json.dumps(call['input'], sort_keys=True)}"
-                    if call_key == _last_failed_call_key:
-                        _consecutive_fail_count += 1
-                    else:
-                        _last_failed_call_key = call_key
-                        _consecutive_fail_count = 1
-                    if _consecutive_fail_count >= 3:
-                        fail_count = _consecutive_fail_count
-                        _consecutive_fail_count = 0
-                        _last_failed_call_key = None
+                call_key = f"{call['toolName']}:{json.dumps(call['input'], sort_keys=True)}"
+                _call_freq[call_key] = _call_freq.get(call_key, 0) + 1
+                freq = _call_freq[call_key]
+                if freq >= 3 and call_key not in _nudged_keys:
+                    _nudged_keys.add(call_key)
+                    if not result.ok:
                         nudge = NUDGE_REPEATED_FAILURE.format(
-                            tool_name=call["toolName"], count=fail_count
+                            tool_name=call["toolName"], count=freq
                         )
-                        current_messages.append({"role": "user", "content": nudge})
-                else:
-                    _last_failed_call_key = None
-                    _consecutive_fail_count = 0
+                    else:
+                        nudge = NUDGE_REPEATED_SAME_SEARCH.format(
+                            tool_name=call["toolName"], count=freq
+                        )
+                    current_messages.append({"role": "user", "content": nudge})
                 if result.awaitUser:
                     if on_assistant_message:
                         on_assistant_message(result.output)
