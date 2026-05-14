@@ -139,7 +139,7 @@ def _extract_from_messages(messages: list[dict[str, Any]]) -> _ExtractedInfo:
             preview = content.strip().replace("\n", " ")
             info.user_intents.append(preview[:200] + ("..." if len(preview) > 200 else ""))
 
-        elif role == "assistant" and content.strip():
+        elif role == "assistant" and content and content.strip():
             text = content.strip()
             for sentence in text.replace("\n", " ").split(". "):
                 if _DECISION_KEYWORDS.search(sentence):
