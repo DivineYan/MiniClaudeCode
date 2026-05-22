@@ -299,7 +299,7 @@ def _handle_input(
         return False
 
     # Local commands
-    local_result = try_handle_local_command(input_text, tools=args.tools)
+    local_result = try_handle_local_command(input_text, tools=args.tools, agent_registry=args.agent_registry)
     if local_result is not None:
         _push_transcript_entry(state, kind="assistant", body=local_result)
         return False
@@ -373,6 +373,7 @@ def _handle_input(
             "skills": args.tools.get_skills(),
             "mcpServers": args.tools.get_mcp_servers(),
         },
+        agent_registry=args.agent_registry,
     )
 
     # Inject task-relevant memories into system prompt
@@ -585,6 +586,7 @@ def _handle_input(
                 on_assistant_stream_chunk=on_assistant_stream_chunk,
                 runtime=args.runtime,
                 memory_injector=args.memory_injector,
+                agent_registry=args.agent_registry,
             )
             with agent_thread_lock:
                 agent_result["messages"] = next_messages

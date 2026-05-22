@@ -17,8 +17,10 @@ import uuid
 from typing import Any
 
 from reconstructed_minicode.tools.base import ToolDefinition, ToolResult
-
-
+from reconstructed_minicode.extensions.agent_loader import discover_agents
+from reconstructed_minicode.model.registry import create_model_adapter
+from reconstructed_minicode.config import load_runtime_config
+from reconstructed_minicode.tools.base import ToolRegistry
 # ---------------------------------------------------------------------------
 # Agent type definitions
 # ---------------------------------------------------------------------------
@@ -69,12 +71,14 @@ def _validate(input_data: dict) -> dict:
     description = input_data.get("description")
     if not isinstance(description, str) or not description.strip():
         raise ValueError("description is required")
-    
+
     agent_type = input_data.get("agent_type", "general")
+    # Built-in types are validated here; custom names are validated at runtime
+    # against the AgentRegistry (loaded from .mini-code/agents/)
     if agent_type not in AGENT_TYPES:
-        valid = ", ".join(AGENT_TYPES.keys())
-        raise ValueError(f"agent_type must be one of: {valid}. Got: {agent_type}")
-    
+        # Treat as a custom agent name — validated in _run against registry
+        pass
+
     return {
         "description": description.strip(),
         "agent_type": agent_type,
@@ -84,93 +88,109 @@ def _validate(input_data: dict) -> dict:
 
 def _run(input_data: dict, context) -> ToolResult:
     """Execute a sub-agent task.
-    
-    This creates an isolated agent loop with:
-    - Its own message history (system + task prompt)
-    - Filtered tools based on agent type
-    - A turn limit
-    - Result summarized for the parent context
+
+    Supports both built-in agent types (explore/plan/general) and custom
+    agents loaded from .mini-code/agents/*.md via AgentRegistry.
     """
-    from reconstructed_minicode.agent.loop import run_agent_turn
-    from reconstructed_minicode.model.registry import create_model_adapter
-    from reconstructed_minicode.agent.context import ContextManager
-    from reconstructed_minicode.security.permissions import PermissionManager
-    from reconstructed_minicode.tools import create_default_tool_registry
-    
+
+
     agent_type = input_data["agent_type"]
-    agent_def = AGENT_TYPES[agent_type]
     task_prompt = input_data["prompt"]
+
+    # --- Resolve agent definition (built-in or custom) ---
+    if agent_type in AGENT_TYPES:
+        raw = AGENT_TYPES[agent_type]
+        agent_def = {
+            "name": raw["name"],
+            "description": raw["description"],
+            "system_prompt": raw["system_prompt"],
+            "allowed_tools": raw["allowed_tools"],
+            "model_override": None,
+            "max_turns": raw["max_turns"],
+        }
+    else:
+        # Look up custom agent from registry (injected via _runtime)
+        registry = None
+        if hasattr(context, "_runtime") and context._runtime:
+            registry = context._runtime.get("_agent_registry")
+        if registry is None:
+            registry = discover_agents(context.cwd)
+
+        custom = registry.find(agent_type)
+        if custom is None:
+            valid = ", ".join(AGENT_TYPES.keys()) + (
+                (", " + ", ".join(registry.names())) if registry.names() else ""
+            )
+            return ToolResult(
+                ok=False,
+                output=f"Unknown agent type '{agent_type}'. Available: {valid}",
+            )
+        agent_def = {
+            "name": custom.name,
+            "description": custom.description,
+            "system_prompt": custom.system_prompt,
+            "allowed_tools": custom.allowed_tools,
+            "model_override": custom.model,
+            "max_turns": custom.max_turns,
+        }
     
-    # Try to get the model from context or fall back to creating one
-    # The context object carries runtime info needed for the model adapter
-    runtime = None
-    model = None
-    
-    # Attempt to extract runtime from the ToolContext
-    if hasattr(context, '_runtime') and context._runtime:
-        runtime = context._runtime
-    
+    # --- Resolve runtime config ---
+    runtime = (getattr(context, "_runtime", None) or {})
     if not runtime:
-        # Try loading from config
         try:
-            from reconstructed_minicode.config import load_runtime_config
+
             runtime = load_runtime_config(context.cwd)
         except Exception:
             pass
-    
     if not runtime:
         return ToolResult(
             ok=False,
-            output="Cannot run sub-agent: no model configuration available. Set ANTHROPIC_API_KEY and ANTHROPIC_MODEL."
+            output="Cannot run sub-agent: no model configuration available. Set ANTHROPIC_API_KEY and ANTHROPIC_MODEL.",
         )
-    
-    # Create a filtered tool registry for this agent type
+
+    # --- Build tool registry ---
+    from reconstructed_minicode.tools import create_default_tool_registry
     full_tools = create_default_tool_registry(context.cwd, runtime=runtime)
     allowed = agent_def["allowed_tools"]
-    
     if allowed is not None:
-        filtered_tools = [t for t in full_tools.list() if t.name in allowed]
-        from reconstructed_minicode.tools.base import ToolRegistry
-        tools = ToolRegistry(filtered_tools)
+        tools = ToolRegistry([t for t in full_tools.list() if t.name in set(allowed)])
     else:
         tools = full_tools
-    
-    # Create model adapter
-    model = create_model_adapter(
-        model=runtime.get("model", ""),
-        tools=tools,
-        runtime=runtime,
-    )
-    
-    # Create isolated permissions (no prompts — auto-deny writes for read-only agents)
-    if agent_def["allowed_tools"] is not None:
-        # Read-only agent: create permission manager that denies writes
+
+    # --- Create model adapter (support per-agent model override) ---
+    model_name = agent_def.get("model_override") or runtime.get("model", "")
+    model = create_model_adapter(model=model_name, tools=tools, runtime=runtime)
+
+    # --- Permissions ---
+    from reconstructed_minicode.security.permissions import PermissionManager
+    if allowed is not None:
         sub_permissions = PermissionManager(context.cwd, prompt=None)
     else:
-        # General agent: inherit parent's permission prompt handler
-        sub_permissions = PermissionManager(context.cwd, prompt=getattr(context.permissions, 'prompt', None))
-    
-    # Build isolated message list
+        sub_permissions = PermissionManager(
+            context.cwd,
+            prompt=getattr(context.permissions, "prompt", None),
+        )
+
+    # --- Build isolated message list ---
     sub_messages = [
         {
             "role": "system",
-            "content": agent_def["system_prompt"]
-            + f"\n\nCurrent cwd: {context.cwd}"
-            + "\n\nIMPORTANT: When you have completed your task, end with <final> and provide your findings."
-            + " Do not ask the user questions — work autonomously with the tools available."
-            + " Be concise and focused."
+            "content": (
+                agent_def["system_prompt"]
+                + f"\n\nCurrent cwd: {context.cwd}"
+                + "\n\nIMPORTANT: When you have completed your task, end with <final> and provide your findings."
+                + " Do not ask the user questions — work autonomously with the tools available."
+                + " Be concise and focused."
+            ),
         },
-        {
-            "role": "user",
-            "content": task_prompt,
-        },
+        {"role": "user", "content": task_prompt},
     ]
-    
-    # Run the sub-agent loop
+
+    # --- Run ---
     start_time = time.time()
     max_turns = agent_def["max_turns"]
-    
     try:
+        from reconstructed_minicode.agent.loop import run_agent_turn
         result_messages = run_agent_turn(
             model=model,
             tools=tools,
@@ -182,39 +202,31 @@ def _run(input_data: dict, context) -> ToolResult:
     except Exception as e:
         return ToolResult(
             ok=False,
-            output=f"Sub-agent ({agent_def['name']}) failed: {type(e).__name__}: {e}"
+            output=f"Sub-agent ({agent_def['name']}) failed: {type(e).__name__}: {e}",
         )
-    
+
     elapsed = time.time() - start_time
-    
-    # Extract the final assistant message as the result
-    final_message = None
-    for msg in reversed(result_messages):
-        if msg.get("role") == "assistant" and msg.get("content", "").strip():
-            final_message = msg["content"]
-            break
-    
-    if not final_message:
-        final_message = "(sub-agent completed without a final message)"
-    
-    # Build summary
-    tool_calls_count = sum(1 for m in result_messages if m.get("role") == "assistant_tool_call")
-    user_messages_count = sum(1 for m in result_messages if m.get("role") == "user")
-    
-    header = (
-        f"[Sub-agent {agent_def['name']} completed]\n"
-        f"  Type: {agent_type}\n"
-        f"  Turns: {user_messages_count} (tool calls: {tool_calls_count})\n"
-        f"  Duration: {elapsed:.1f}s\n"
-        f"  Max turns: {max_turns}\n"
+
+    # --- Extract result ---
+    final_message = next(
+        (m["content"] for m in reversed(result_messages)
+         if m.get("role") == "assistant" and (m.get("content") or "").strip()),
+        "(sub-agent completed without a final message)",
     )
-    
-    # Truncate very long results
-    result_text = final_message
+
+    tool_calls_count = sum(1 for m in result_messages if m.get("tool_calls"))
+    user_messages_count = sum(1 for m in result_messages if m.get("role") == "user")
+
+    header = (
+        f"[Sub-agent '{agent_def['name']}' completed]\n"
+        f"  Turns: {user_messages_count}  Tool calls: {tool_calls_count}  Duration: {elapsed:.1f}s\n"
+    )
+
     MAX_RESULT_LEN = 8000
+    result_text = final_message
     if len(result_text) > MAX_RESULT_LEN:
         result_text = result_text[:MAX_RESULT_LEN] + f"\n\n... (truncated, {len(final_message)} chars total)"
-    
+
     return ToolResult(ok=True, output=header + "\n" + result_text)
 
 
@@ -223,8 +235,8 @@ task_tool = ToolDefinition(
     description=(
         "Launch a sub-agent to handle a complex task autonomously. "
         "The sub-agent runs in its own isolated context with a turn limit. "
-        "Use 'explore' for fast read-only codebase exploration, "
-        "'plan' for thorough analysis, or 'general' for full-featured multi-step work. "
+        "Built-in types: 'explore' (fast read-only search), 'plan' (thorough analysis), 'general' (full tools). "
+        "Custom agents defined in .mini-code/agents/ can be referenced by name. "
         "The sub-agent's final result is returned to you."
     ),
     input_schema={
@@ -240,8 +252,11 @@ task_tool = ToolDefinition(
             },
             "agent_type": {
                 "type": "string",
-                "enum": ["explore", "plan", "general"],
-                "description": "Type of sub-agent: 'explore' (fast, read-only), 'plan' (thorough, read-only), 'general' (full tools, default)",
+                "description": (
+                    "Agent type to use. Built-in: 'explore' (fast, read-only), "
+                    "'plan' (thorough, read-only), 'general' (full tools, default). "
+                    "Or use the name of a custom agent from .mini-code/agents/."
+                ),
             },
         },
         "required": ["description"],

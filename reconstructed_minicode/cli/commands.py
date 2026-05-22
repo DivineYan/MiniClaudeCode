@@ -37,6 +37,7 @@ SLASH_COMMANDS = [
     SlashCommand("/model", "/model <model-name>", "Persist a model override into ~/.mini-code/settings.json."),
     SlashCommand("/config-paths", "/config-paths", "Show mini-code and Claude fallback settings paths."),
     SlashCommand("/skills", "/skills", "List discovered SKILL.md workflows."),
+    SlashCommand("/agents", "/agents", "List available custom subagents loaded from .mini-code/agents/."),
     SlashCommand("/mcp", "/mcp", "Show configured MCP servers and connection state."),
     SlashCommand("/permissions", "/permissions", "Show mini-code permission storage path."),
     SlashCommand("/exit", "/exit", "Exit mini-code."),
@@ -70,6 +71,7 @@ def format_slash_commands() -> str:
         "🛠️ Tool Commands": [
             ("/tools", "List all available tools"),
             ("/skills", "List discovered SKILL.md workflows"),
+            ("/agents", "List available custom subagents"),
             ("/mcp", "Show MCP servers and connection state"),
             ("/cmd", "Run development commands directly"),
         ],
@@ -126,7 +128,7 @@ def complete_slash_command(line: str) -> tuple[list[str], str]:
     return (hits if hits else [command.usage for command in SLASH_COMMANDS], line)
 
 
-def try_handle_local_command(user_input: str, tools=None) -> str | None:
+def try_handle_local_command(user_input: str, tools=None, agent_registry=None) -> str | None:
     if user_input in {"/", "/help"}:
         return format_slash_commands()
 
@@ -142,6 +144,26 @@ def try_handle_local_command(user_input: str, tools=None) -> str | None:
 
     if user_input == "/permissions":
         return f"permission store: {MINI_CODE_PERMISSIONS_PATH}"
+
+    if user_input == "/agents":
+        if agent_registry is None:
+            return "No agent registry available."
+        agents = agent_registry.list()
+        if not agents:
+            return (
+                "No custom agents discovered.\n"
+                "Add agent definitions under .mini-code/agents/<name>.md or ~/.mini-code/agents/<name>.md"
+            )
+        lines = [f"Custom subagents ({len(agents)} found):"]
+        for ag in agents:
+            tools_str = ", ".join(ag.allowed_tools) if ag.allowed_tools else "all tools"
+            model_str = ag.model or "inherit"
+            lines.append(f"  {ag.name}")
+            lines.append(f"    {ag.description}")
+            lines.append(f"    tools={tools_str}  model={model_str}  max_turns={ag.max_turns}")
+            lines.append(f"    source={ag.source_file}")
+        lines.append("\nInvoke via: task(agent_type='<name>', prompt='...')")
+        return "\n".join(lines)
 
     if user_input == "/skills":
         skills = tools.get_skills() if tools else []

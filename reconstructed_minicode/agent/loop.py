@@ -371,7 +371,12 @@ def run_agent_turn(
     runtime: dict | None = None,
     metrics_collector: AgentMetricsCollector | None = None,
     memory_injector: MemoryInjector | None = None,
+    agent_registry: Any | None = None,
 ) -> list[ChatMessage]:
+    # Thread agent_registry into runtime so task tool can access custom agents
+    if agent_registry is not None:
+        runtime = {**(runtime or {}), "_agent_registry": agent_registry}
+
     current_messages = list(messages)
     saw_tool_result = False
     empty_retry = 0

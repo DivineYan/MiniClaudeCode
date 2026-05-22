@@ -12,6 +12,7 @@ from reconstructed_minicode.cli.commands import try_handle_local_command
 from reconstructed_minicode.cli.manage import maybe_handle_management_command
 from reconstructed_minicode.cli.shortcuts import parse_local_tool_shortcut
 from reconstructed_minicode.config import load_runtime_config
+from reconstructed_minicode.extensions.agent_loader import AgentRegistry, discover_agents
 from reconstructed_minicode.extensions.hooks import load_hooks_from_config
 from reconstructed_minicode.extensions.memory import MemoryManager
 from reconstructed_minicode.security.permissions import PermissionManager
@@ -48,6 +49,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log-level", default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level (default: WARNING)",
+    )
+    parser.add_argument(
+        "--cwd", default=None, metavar="DIR",
+        help="Working directory to open (defaults to current terminal directory)",
+    )
+    parser.add_argument(
+        "path", nargs="?", default=None, metavar="PATH",
+        help="Working directory to open (positional shorthand for --cwd)",
     )
     return parser.parse_args()
 
@@ -99,14 +108,20 @@ def _save_transcript_file(cwd: str, permissions, transcript: list[TranscriptEntr
     return str(target)
 
 
-def _build_system_message(cwd: str, permissions, tools, memory_mgr: MemoryManager | None = None) -> dict:
+def _build_system_message(
+    cwd: str,
+    permissions,
+    tools,
+    memory_mgr: MemoryManager | None = None,
+    agent_registry: AgentRegistry | None = None,
+) -> dict:
     extras = {
         "skills": tools.get_skills(),
         "mcpServers": tools.get_mcp_servers(),
     }
     if memory_mgr:
         extras["memory_context"] = memory_mgr.get_relevant_context()
-    return {"role": "system", "content": build_system_prompt(cwd, permissions.get_summary(), extras)}
+    return {"role": "system", "content": build_system_prompt(cwd, permissions.get_summary(), extras, agent_registry=agent_registry)}
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +162,7 @@ def _init_components(args: argparse.Namespace, cwd: str):
 
     context_mgr = ContextManager(model=runtime.get("model", "default")) if runtime else None
     memory_mgr = MemoryManager(project_root=Path(cwd))
+    agent_registry = discover_agents(cwd)
 
     app_store = create_app_store(initial={
         "session_id": args.session or "new",
@@ -154,8 +170,12 @@ def _init_components(args: argparse.Namespace, cwd: str):
         "model": runtime.get("model", "mock") if runtime else "mock",
     })
 
-    logger.info("Components initialised (model=%s)", app_store.get_state().model)
-    return runtime, tools, permissions, model, context_mgr, memory_mgr, app_store
+    logger.info(
+        "Components initialised (model=%s, agents=%d)",
+        app_store.get_state().model,
+        len(agent_registry.list()),
+    )
+    return runtime, tools, permissions, model, context_mgr, memory_mgr, agent_registry, app_store
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +194,7 @@ def _run_cli_mode(
     messages: list,
     history: list,
     transcript: list[TranscriptEntry],
+    agent_registry: AgentRegistry | None = None,
 ) -> None:
     for raw_input in sys.stdin:
         user_input = raw_input.strip()
@@ -191,7 +212,7 @@ def _run_cli_mode(
             continue
 
         # Slash commands
-        local_result = try_handle_local_command(user_input, tools=tools)
+        local_result = try_handle_local_command(user_input, tools=tools, agent_registry=agent_registry)
         if user_input == "/tools":
             local_result = "\n".join(f"{t.name}: {t.description}" for t in tools.list())
         if local_result is not None:
@@ -215,7 +236,7 @@ def _run_cli_mode(
         history.append(user_input)
         save_history_entries(history)
 
-        messages[0] = _build_system_message(cwd, permissions, tools)
+        messages[0] = _build_system_message(cwd, permissions, tools, agent_registry=agent_registry)
         permissions.begin_turn()
         messages = run_agent_turn(
             model=model,
@@ -226,6 +247,7 @@ def _run_cli_mode(
             store=app_store,
             context_manager=context_mgr,
             runtime=runtime,
+            agent_registry=agent_registry,
         )
         permissions.end_turn()
 
@@ -253,15 +275,23 @@ def main() -> None:
         install_main()
         return
 
-    cwd = str(Path.cwd())
+    raw_cwd = args.cwd or args.path
+    if raw_cwd:
+        target = Path(raw_cwd).expanduser().resolve()
+        if not target.is_dir():
+            print(f"Error: '{raw_cwd}' is not a directory.", file=sys.stderr)
+            sys.exit(1)
+        cwd = str(target)
+    else:
+        cwd = str(Path.cwd())
     argv = sys.argv[1:]
     management_argv = [argv[0]] if argv and not argv[0].startswith("--") else []
     if maybe_handle_management_command(cwd, management_argv):
         return
 
-    runtime, tools, permissions, model, context_mgr, memory_mgr, app_store = _init_components(args, cwd)
+    runtime, tools, permissions, model, context_mgr, memory_mgr, agent_registry, app_store = _init_components(args, cwd)
 
-    messages = [_build_system_message(cwd, permissions, tools, memory_mgr)]
+    messages = [_build_system_message(cwd, permissions, tools, memory_mgr, agent_registry)]
     history = load_history_entries()
     transcript: list[TranscriptEntry] = []
 
@@ -276,6 +306,7 @@ def main() -> None:
                 cwd=cwd, runtime=runtime, tools=tools, permissions=permissions,
                 model=model, context_mgr=context_mgr, app_store=app_store,
                 messages=messages, history=history, transcript=transcript,
+                agent_registry=agent_registry,
             )
         else:
             run_tty_app(
@@ -283,6 +314,7 @@ def main() -> None:
                 cwd=cwd, permissions=permissions,
                 resume_session=args.resume,
                 list_sessions_only=args.list_sessions,
+                agent_registry=agent_registry,
             )
     except KeyboardInterrupt:
         print("\nInterrupted.")

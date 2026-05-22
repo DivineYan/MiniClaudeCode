@@ -85,6 +85,7 @@ def build_system_prompt(
     cwd: str,
     permission_summary: list[str] | None = None,
     extras: dict | None = None,
+    agent_registry=None,
 ) -> str:
     """Build the system prompt using dynamic paragraph assembly.
 
@@ -215,6 +216,19 @@ def build_system_prompt(
             return "\n".join(lines)
 
         pipeline.register_dynamic("mcp", _build_mcp, cache_ttl=60.0)
+
+    # Custom subagents section
+    if agent_registry is not None:
+        custom_agents = agent_registry.list()
+        if custom_agents:
+            def _build_agents():
+                lines = ["## Custom Subagents (use via task tool with agent_type=<name>)"]
+                for ag in custom_agents:
+                    tools_str = ", ".join(ag.allowed_tools) if ag.allowed_tools else "all tools"
+                    model_str = ag.model or "inherit"
+                    lines.append(f"- {ag.name}: {ag.description} [tools: {tools_str}, model: {model_str}]")
+                return "\n".join(lines)
+            pipeline.register_dynamic("custom_agents", _build_agents)
 
     # Global CLAUDE.md (file-cached)
     global_claude_md = _maybe_read(Path.home() / ".claude" / "CLAUDE.md")

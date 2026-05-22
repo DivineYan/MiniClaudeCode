@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from reconstructed_minicode.extensions.memory import MemoryManager
     from reconstructed_minicode.extensions.memory_injector import MemoryInjector
+    from reconstructed_minicode.extensions.agent_loader import AgentRegistry
 
 
 @dataclass
@@ -27,6 +28,7 @@ class TtyAppArgs:
     permissions: PermissionManager
     memory_mgr: MemoryManager | None = None
     memory_injector: MemoryInjector | None = None
+    agent_registry: AgentRegistry | None = None
 
 
 @dataclass
